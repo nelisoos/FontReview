@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreText
+import UniformTypeIdentifiers
 
 struct FontItem: Identifiable {
     let id: String     // PostScript name
@@ -42,7 +43,9 @@ final class Model: ObservableObject {
     @Published var search = ""
     @Published var expanded = Set<String>()
     @Published var size: Double = 28
-    let families = loadUserFonts()
+    @Published var families: [Family] = loadUserFonts()
+    @Published var status = ""
+    @Published var detail: FontItem?
 
     var filtered: [Family] {
         let q = search.trimmingCharacters(in: .whitespaces)
@@ -53,8 +56,191 @@ final class Model: ObservableObject {
         }
     }
 
+    func fontFiles(_ urls: [URL]) -> [URL] {
+        let exts = ["ttf", "otf", "ttc", "otc"]
+        var out: [URL] = []
+        for u in urls {
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir)
+            if isDir.boolValue {
+                if let en = FileManager.default.enumerator(at: u, includingPropertiesForKeys: nil) {
+                    for case let f as URL in en where exts.contains(f.pathExtension.lowercased()) { out.append(f) }
+                }
+            } else if exts.contains(u.pathExtension.lowercased()) {
+                out.append(u)
+            }
+        }
+        return out
+    }
+
+    func install(_ urls: [URL]) {
+        let files = fontFiles(urls)
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Fonts")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var ok = 0, skipped = 0
+        for f in files {
+            let dest = dir.appendingPathComponent(f.lastPathComponent)
+            if FileManager.default.fileExists(atPath: dest.path) { skipped += 1; continue }
+            do {
+                try FileManager.default.copyItem(at: f, to: dest)
+                CTFontManagerRegisterFontsForURL(dest as CFURL, .process, nil)
+                ok += 1
+            } catch { skipped += 1 }
+        }
+        families = loadUserFonts()
+        status = files.isEmpty ? "No font files found" : "Installed \(ok), skipped \(skipped)"
+    }
+
+    func pick() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        if panel.runModal() == .OK { install(panel.urls) }
+    }
+
+    func handleDrop(_ providers: [NSItemProvider]) {
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var urls: [URL] = []
+        for p in providers {
+            group.enter()
+            p.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                if let d = item as? Data, let u = URL(dataRepresentation: d, relativeTo: nil) {
+                    lock.lock(); urls.append(u); lock.unlock()
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { self.install(urls) }
+    }
+
     func toggle(_ id: String) {
         if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+    }
+}
+
+struct GlyphInfo: Identifiable {
+    let id: Int
+    let name: String
+    var isOrnament: Bool { name.lowercased().hasPrefix("orn") }
+}
+
+struct GlyphShape: Shape {
+    let font: CTFont
+    let glyph: CGGlyph
+
+    func path(in rect: CGRect) -> Path {
+        guard let cg = CTFontCreatePathForGlyph(font, glyph, nil) else { return Path() }
+        let b = cg.boundingBoxOfPath
+        guard b.width > 0, b.height > 0 else { return Path() }
+        var s = min(rect.width, rect.height) * 0.6 / 100   // font is created at 100pt
+        if b.width * s > rect.width * 0.9 { s = rect.width * 0.9 / b.width }
+        if b.height * s > rect.height * 0.9 { s = rect.height * 0.9 / b.height }
+        var ty = rect.minY + rect.height * 0.7
+        let top = ty - b.maxY * s
+        let bottom = ty - b.minY * s
+        if top < rect.minY + rect.height * 0.05 || bottom > rect.maxY - rect.height * 0.05 {
+            ty = rect.midY + b.midY * s
+        }
+        let t = CGAffineTransform(translationX: rect.midX - b.midX * s, y: ty).scaledBy(x: s, y: -s)
+        return Path(cg).applying(t)
+    }
+}
+
+final class GlyphModel: ObservableObject {
+    let ct: CTFont
+    let glyphs: [GlyphInfo]
+    @Published var search = ""
+    @Published var selected: GlyphInfo?
+
+    init(ps: String) {
+        ct = CTFontCreateWithName(ps as CFString, 100, nil)
+        let cg = CTFontCopyGraphicsFont(ct, nil)
+        let all = (0..<cg.numberOfGlyphs).map { i -> GlyphInfo in
+            let n = cg.name(for: CGGlyph(i)).map { $0 as String } ?? "gid\(i)"
+            return GlyphInfo(id: i, name: n)
+        }
+        // regular glyphs first, ornaments (orn*) at the end, original order kept
+        glyphs = all.filter { !$0.isOrnament } + all.filter { $0.isOrnament }
+    }
+
+    var ornamentCount: Int { glyphs.filter { $0.isOrnament }.count }
+
+    var filtered: [GlyphInfo] {
+        let q = search.trimmingCharacters(in: .whitespaces)
+        return glyphs.filter { g in
+            q.isEmpty || g.name.localizedCaseInsensitiveContains(q)
+        }
+    }
+}
+
+struct GlyphBookView: View {
+    let item: FontItem
+    let close: () -> Void
+    @StateObject private var g: GlyphModel
+
+    init(item: FontItem, close: @escaping () -> Void) {
+        self.item = item
+        self.close = close
+        _g = StateObject(wrappedValue: GlyphModel(ps: item.id))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading) {
+                    Text(item.name).font(.headline)
+                    Text(g.ornamentCount > 0 ? "\(g.glyphs.count) glyphs, \(g.ornamentCount) ornaments at the end" : "\(g.glyphs.count) glyphs").font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Done") { close() }.keyboardShortcut(.cancelAction)
+            }
+            .padding(12)
+            HStack {
+                TextField("Glyph name", text: $g.search)
+                    .textFieldStyle(.roundedBorder)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 12)
+            Divider()
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 72, maximum: 72), spacing: 6)], spacing: 6) {
+                    ForEach(g.filtered) { gl in
+                        GlyphShape(font: g.ct, glyph: CGGlyph(gl.id))
+                            .fill(Color.primary)
+                            .frame(width: 72, height: 72)
+                            .overlay(
+                                Rectangle().stroke(
+                                    g.selected?.id == gl.id ? Color.accentColor : Color.secondary.opacity(0.3),
+                                    lineWidth: g.selected?.id == gl.id ? 2 : 1)
+                            )
+                            .contentShape(Rectangle())
+                            .onTapGesture { g.selected = gl }
+                    }
+                }
+                .padding(12)
+            }
+            Divider()
+            HStack(spacing: 16) {
+                if let sel = g.selected {
+                    GlyphShape(font: g.ct, glyph: CGGlyph(sel.id))
+                        .fill(Color.primary)
+                        .frame(width: 100, height: 100)
+                        .overlay(Rectangle().stroke(Color.secondary.opacity(0.3)))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(sel.name).font(.headline).textSelection(.enabled)
+                        Text("Glyph index \(sel.id)").foregroundColor(.secondary)
+                    }
+                } else {
+                    Text("Select a glyph").foregroundColor(.secondary)
+                }
+                Spacer()
+            }
+            .padding(12)
+            .frame(height: 124)
+        }
+        .frame(minWidth: 720, minHeight: 600)
     }
 }
 
@@ -86,6 +272,14 @@ struct ContentView: View {
                             .disabled(m.size == ContentView.defaultSize)
                     }
                 }
+                Section("Install") {
+                    Button("Install Fonts…") { m.pick() }
+                    Text("or drop font files / folders onto the list")
+                        .font(.caption).foregroundColor(.secondary)
+                    if !m.status.isEmpty {
+                        Text(m.status).font(.caption).foregroundColor(.secondary)
+                    }
+                }
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 360)
@@ -96,6 +290,7 @@ struct ContentView: View {
                         let multi = fam.items.count > 1
                         let open = m.expanded.contains(fam.id)
                         VStack(alignment: .leading, spacing: 0) {
+                            HStack(spacing: 0) {
                             Button { if multi { m.toggle(fam.id) } } label: {
                                 HStack(alignment: .center, spacing: 8) {
                                     Image(systemName: open ? "chevron.down" : "chevron.right")
@@ -117,6 +312,9 @@ struct ContentView: View {
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            Button("Details") { m.detail = fam.rep }
+                                .padding(.trailing, 12)
+                            }
                             if multi && open {
                                 ForEach(fam.items) { it in
                                     VStack(alignment: .leading, spacing: 2) {
@@ -129,6 +327,11 @@ struct ContentView: View {
                                     .padding(.trailing, 12)
                                     .padding(.vertical, 6)
                                     .frame(maxWidth: .infinity, alignment: .leading)
+                                    .overlay(alignment: .topTrailing) {
+                                        Button("Details") { m.detail = it }
+                                            .padding(.trailing, 12)
+                                            .padding(.top, 6)
+                                    }
                                 }
                             }
                             Divider()
@@ -136,8 +339,15 @@ struct ContentView: View {
                     }
                 }
             }
+            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                m.handleDrop(providers)
+                return true
+            }
         }
         .frame(minWidth: 700, minHeight: 500)
+        .sheet(item: $m.detail) { it in
+            GlyphBookView(item: it) { m.detail = nil }
+        }
     }
 }
 
